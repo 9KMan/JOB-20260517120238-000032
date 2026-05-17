@@ -1,0 +1,228 @@
+# SPEC: Walk-in Service Booking Platform
+
+## 1. Project Overview
+
+**Client:** Service Booking Platform (B2C marketplace)
+**Goal:** Build a production monorepo backend for a walk-in service booking platform — real-time bookings, vendor matching, Stripe payments, geolocation search.
+**Tech Stack:** Node.js + Express + TypeScript, PostgreSQL + Drizzle ORM, Stripe, pnpm workspaces + Turborepo, Zod v4 validation.
+
+---
+
+## 2. Architecture
+
+```
+┌─────────────────────┐     ┌──────────────────────┐     ┌─────────────────┐
+│   Mobile / Web      │────▶│   Express API        │────▶│  PostgreSQL     │
+│   Client            │     │   (REST, Zod v4)     │     │  (Drizzle ORM)  │
+└─────────────────────┘     └──────────────────────┘     └─────────────────┘
+                                   │
+                                   ▼
+                          ┌──────────────────┐
+                          │  Stripe Gateway  │
+                          │  (auth + capture)│
+                          └──────────────────┘
+```
+
+### Monorepo Structure (pnpm workspaces + Turborepo)
+
+```
+booking-platform/
+├── apps/
+│   └── api/                    # Express TypeScript API
+│       ├── src/
+│       │   ├── routes/         # Route handlers
+│       │   │   ├── customers.ts
+│       │   │   ├── vendors.ts
+│       │   │   ├── bookings.ts
+│       │   │   ├── payments.ts
+│       │   │   └── admin.ts
+│       │   ├── middleware/     # Auth, validation, error
+│       │   ├── services/      # Business logic
+│       │   │   ├── booking.service.ts
+│       │   │   ├── matching.service.ts
+│       │   │   └── payment.service.ts
+│       │   ├── repositories/ # Drizzle query builders
+│       │   │   ├── customer.repo.ts
+│       │   │   ├── vendor.repo.ts
+│       │   │   ├── booking.repo.ts
+│       │   │   └── location.repo.ts
+│       │   ├── db/            # Drizzle schema + migrations
+│       │   │   ├── schema.ts
+│       │   │   └── migrations/
+│       │   └── app.ts         # Express app entry
+│       └── package.json
+├── packages/
+│   └── shared/                 # Shared Zod schemas + types
+│       ├── src/
+│       │   ├── schemas/       # Zod v4 schemas (booking, customer, vendor)
+│       │   └── types/         # TypeScript interfaces
+│       └── package.json
+├── pnpm-workspace.yaml
+├── turbo.json
+└── package.json
+```
+
+---
+
+## 3. Core Workstreams
+
+### Workstream 1: Database Schema & Migrations
+
+- **Drizzle ORM** schema with typed tables: `customers`, `vendors`, `bookings`, `services`, `locations`
+- Repository pattern: every DB operation goes through a repository (NO raw SQL in route handlers)
+- Geolocation: PostGIS extension for `ST_DWithin` proximity queries + `ST_Distance`
+- Migrations: `drizzle-kit generate` + `drizzle-kit migrate`
+
+### Workstream 2: REST API Design (Zod v4 Validation)
+
+- All routes validated with Zod v4 schemas (no `any`, no `as`)
+- Three auth factories: `CustomerAuth`, `VendorAuth`, `AdminAuth` (JWT + role middleware)
+- Backward-compatible API versioning: `/v1/` prefix, deprecation headers on old routes
+- Route structure:
+  - `POST /v1/bookings` — create booking
+  - `GET /v1/bookings/:id` — get booking status
+  - `PATCH /v1/bookings/:id/status` — status transitions (pending → matched → paid → completed)
+  - `GET /v1/vendors/nearby?lat=&lng=&radius=` — geolocation search
+  - `POST /v1/payments/intent` — create Stripe payment intent (authorization hold)
+  - `POST /v1/payments/capture/:id` — capture after service completion
+
+### Workstream 3: Vendor Matching
+
+- Distance-based matching: find vendors within configurable radius
+- Availability windows: vendors set weekly schedules, bookings checked against availability
+- Service category filtering: match customer service type to vendor capabilities
+- Booking conflict detection: no double-booking same vendor time slot
+
+### Workstream 4: Stripe Payment Flows
+
+- **Authorization only** at booking creation (hold funds, don't capture)
+- **Capture** triggered when vendor marks service complete
+- **Cancel/void** if customer cancels within policy window
+- Stripe webhook handler: `payment_intent.succeeded`, `payment_intent.canceled`, `charge.refunded`
+
+### Workstream 5: Geolocation Features
+
+- Coordinate storage: `ST_SetSRID(ST_MakePoint(lng, lat), 4326)` in PostgreSQL
+- Distance search: `ST_DWithin(geometry, ST_MakePoint({lat},{lng})::geography, {radius_meters})`
+- Haversine distance calculation for sorted results
+- City resolution: reverse geocode to city name via Nominatim (OpenStreetMap, no API key needed)
+
+---
+
+## 4. Data Model
+
+### Core Tables
+
+```sql
+-- customers
+id          UUID PK
+email       TEXT UNIQUE NOT NULL
+name        TEXT NOT NULL
+phone       TEXT
+password_hash TEXT
+created_at  TIMESTAMPTZ DEFAULT now()
+
+-- vendors
+id          UUID PK
+email       TEXT UNIQUE NOT NULL
+name        TEXT NOT NULL
+phone       TEXT
+password_hash TEXT
+category    TEXT NOT NULL  -- e.g. 'haircut', 'auto-repair', 'cleaning'
+rating      NUMERIC(3,2) DEFAULT 0
+created_at  TIMESTAMPTZ DEFAULT now()
+
+-- locations (vendor service area)
+id          UUID PK
+vendor_id   UUID FK → vendors
+lat         NUMERIC(9,6) NOT NULL
+lng         NUMERIC(9,6) NOT NULL
+city        TEXT
+radius_km   INTEGER DEFAULT 5
+geography   GEOGRAPHY(POINT, 4326) -- GIN indexed
+
+-- services (what a vendor offers)
+id          UUID PK
+vendor_id   UUID FK → vendors
+name        TEXT NOT NULL
+duration_minutes INTEGER NOT NULL
+price_cents INTEGER NOT NULL
+
+-- bookings
+id          UUID PK
+customer_id UUID FK → customers
+vendor_id   UUID FK → vendors
+service_id  UUID FK → services
+status      TEXT DEFAULT 'pending'  -- pending|matched|paid|completed|cancelled
+booking_at  TIMESTAMPTZ NOT NULL   -- requested time
+lat         NUMERIC(9,6)           -- service location
+lng         NUMERIC(9,6)
+stripe_payment_intent_id TEXT
+authorized_cents INTEGER
+captured_cents INTEGER
+created_at  TIMESTAMPTZ DEFAULT now()
+
+-- vendor_availability (weekly schedule)
+id          UUID PK
+vendor_id   UUID FK → vendors
+day_of_week INTEGER (0=Sun,6=Sat)
+start_time  TIME
+end_time    TIME
+```
+
+---
+
+## 5. API Design
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | /v1/customers/register | — | Register customer |
+| POST | /v1/customers/login | — | JWT login |
+| GET | /v1/customers/me | Customer | Get profile |
+| POST | /v1/vendors/register | — | Register vendor |
+| POST | /v1/vendors/login | — | JWT login |
+| GET | /v1/vendors/nearby | — | Geo search vendors |
+| GET | /v1/vendors/:id | — | Vendor detail |
+| POST | /v1/vendors/:id/services | Vendor | Add service |
+| POST | /v1/bookings | Customer | Create booking (auth hold) |
+| GET | /v1/bookings | Customer/Vendor | List bookings |
+| GET | /v1/bookings/:id | — | Booking detail |
+| PATCH | /v1/bookings/:id/status | Vendor | Transition status |
+| POST | /v1/payments/intent | Customer | Create Stripe intent |
+| POST | /v1/payments/capture/:id | System | Capture on completion |
+| POST | /v1/payments/cancel/:id | Customer | Void/cancel intent |
+| POST | /v1/webhooks/stripe | — | Stripe webhook handler |
+
+---
+
+## 6. Technical Decisions
+
+1. **Drizzle ORM over Prisma** — job explicitly specifies Drizzle; type-safe queries, no raw SQL, migration-first workflow with `drizzle-kit`.
+2. **Authorization hold → capture flow** — funds authorized at booking, captured on service completion. Reduces no-show losses.
+3. **Repository pattern** — all DB access through `*.repo.ts` files. Route handlers never call `db.execute()` directly.
+4. **pnpm workspaces + Turborepo** — shared schemas in `packages/shared`, consumed by `apps/api`. Turbo cache for fast CI.
+5. **Zod v4** — all request/response validation. Schemas shared between API and tests via `packages/shared`.
+6. **No PostGIS dependency** — use native `GEOGRAPHY` type with `ST_DWithin` for proximity. Works on standard PostgreSQL 12+.
+7. **JWT + role middleware** — three factories, validated via `authorize(req, 'customer' | 'vendor' | 'admin')`.
+8. **Backward compatibility** — `/v1/` prefix, `Deprecation` header on routes planned for removal.
+
+---
+
+## 7. Out of Scope
+
+- Mobile apps (REST API only)
+- Real-time WebSocket updates (polling acceptable for v1)
+- Multi-vendor loyalty programs
+- Refund logic beyond Stripe webhooks
+- Vendor onboarding KYC flow
+
+---
+
+## 8. Success Metrics
+
+- All endpoints return typed responses (no `unknown`)
+- Zero raw SQL in route handlers
+- Booking status transitions are atomic (no partial state)
+- Stripe authorization/capture flow verified end-to-end
+- Geolocation search returns vendors sorted by distance within 50ms (p95)
+- Monorepo builds pass Turborepo with shared schema cache hit
